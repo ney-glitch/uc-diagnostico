@@ -1,20 +1,18 @@
 """
 =============================================================
-  UNIVERSO CRIATIVO — COLETA DE DADOS PARA DIAGNÓSTICO v2
-  
+  UNIVERSO CRIATIVO — COLETA DE DADOS PARA DIAGNÓSTICO v3
+
   Melhorias desta versão:
-  - Busca GMN com variações do nome (resolve nomes diferentes)
-  - Concorrentes por nicho + cidade integrados
-  - Meta Ad Library (anúncios públicos da empresa)
-  - Campo trafegoPago do formulário mapeado
-  - Dados mais ricos formatados pro Claude
+  - YouTube busca pelo canal informado pelo lead (não mais por nome)
+  - Meta Ad Library via scraping público (sem token)
+  - Todas as melhorias anteriores mantidas
 =============================================================
 
 DEPENDÊNCIAS:
     pip install requests beautifulsoup4 flask
 
 USO LOCAL:
-    python uc_diagnostico.py --empresa "The Rocks Barbearia" --instagram rocksbarber --cidade "Porto Velho" --nicho "Barbearia"
+    python uc_diagnostico.py --empresa "The Rocks Barbearia" --instagram therocksbarbearia --cidade "Porto Velho" --nicho "Barbearia" --youtube "therocksbarbearia"
 
 USO COMO API (Railway):
     Sem argumentos = sobe servidor web na porta 8080
@@ -34,11 +32,6 @@ from flask import Flask, request, jsonify
 # =============================================================
 
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "SUA_CHAVE_AQUI")
-
-# Token público da Meta Ad Library — gratuito
-# Gerar em: developers.facebook.com → Ferramentas → Explorador de API
-# Permissão necessária: ads_read (pública)
-META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "SEU_TOKEN_AQUI")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -65,19 +58,13 @@ def safe_get(url, params=None, timeout=10):
 
 
 def gerar_variacoes_nome(nome):
-    """
-    Gera variações do nome para busca no GMN.
-    Ex: "The Rocks Barbearia" → ["The Rocks Barbearia", "The Rocks", "Rocks Barbearia"]
-    """
     variacoes = [nome]
     partes = nome.split()
-
     if len(partes) >= 2:
         variacoes.append(" ".join(partes[1:]))
         variacoes.append(" ".join(partes[:2]))
         if len(partes) >= 3:
             variacoes.append(partes[-1] + " " + partes[0])
-
     vistos = set()
     resultado = []
     for v in variacoes:
@@ -141,7 +128,6 @@ def coletar_instagram(username):
 
         if resultado["seguidores"] or resultado["nome_exibicao"]:
             resultado["disponivel"] = True
-
             if resultado["seguidores"]:
                 seg_str = resultado["seguidores"].replace(",", "").replace(".", "")
                 try:
@@ -156,7 +142,6 @@ def coletar_instagram(username):
                         resultado["observacoes"].append("Perfil com boa base de seguidores")
                 except:
                     pass
-
             if resultado["total_posts"]:
                 try:
                     posts_num = int(resultado["total_posts"].replace(",", "").replace(".", ""))
@@ -179,7 +164,7 @@ def coletar_instagram(username):
 
 
 # =============================================================
-# GOOGLE MEU NEGÓCIO — com variações de nome
+# GOOGLE MEU NEGÓCIO
 # =============================================================
 
 def buscar_place_por_query(query):
@@ -350,10 +335,14 @@ def buscar_concorrentes(nicho, cidade, limite=5):
 
 
 # =============================================================
-# META AD LIBRARY
+# META AD LIBRARY — scraping público (sem token)
 # =============================================================
 
 def buscar_anuncios_meta(nome_empresa):
+    """
+    Busca anúncios ativos na Biblioteca de Anúncios do Meta via scraping público.
+    Não precisa de token — a biblioteca é pública.
+    """
     resultado = {
         "disponivel": False,
         "roda_anuncios": False,
@@ -363,67 +352,92 @@ def buscar_anuncios_meta(nome_empresa):
         "observacoes": []
     }
 
-    if not META_ACCESS_TOKEN or META_ACCESS_TOKEN == "SEU_TOKEN_AQUI":
-        resultado["motivo"] = "Token Meta não configurado"
-        resultado["observacoes"].append("Configure META_ACCESS_TOKEN para buscar anúncios")
-        return resultado
-
-    url = "https://graph.facebook.com/v19.0/ads_archive"
-    params = {
-        "access_token": META_ACCESS_TOKEN,
-        "search_terms": nome_empresa,
-        "ad_reached_countries": '["BR"]',
-        "ad_active_status": "ACTIVE",
-        "limit": 10,
-        "fields": "ad_creative_body,ad_delivery_start_time,publisher_platforms,page_name",
-    }
-
     try:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
+        # URL pública da biblioteca de anúncios
+        nome_encoded = requests.utils.quote(nome_empresa)
+        url = f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=BR&q={nome_encoded}&search_type=keyword_unordered"
 
-        if "error" in data:
-            resultado["motivo"] = f"Erro API Meta: {data['error'].get('message', '')}"
+        headers_meta = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+        }
+
+        resp = requests.get(url, headers=headers_meta, timeout=20)
+
+        if resp.status_code != 200:
+            resultado["motivo"] = f"Biblioteca Meta retornou erro {resp.status_code}"
+            resultado["observacoes"].append(f"Verificar manualmente: {url}")
             return resultado
 
-        anuncios = data.get("data", [])
+        html = resp.text
 
-        if anuncios:
-            resultado["disponivel"] = True
+        # Tenta extrair dados do JSON embutido na página
+        # A biblioteca do Meta embute dados em scripts JSON
+        json_matches = re.findall(r'__bbox\s*=\s*(\{.*?\});', html, re.DOTALL)
+
+        anuncios_encontrados = 0
+        paginas_encontradas = set()
+
+        for match in json_matches[:5]:
+            try:
+                data = json.loads(match)
+                # Navega pela estrutura procurando anúncios
+                str_data = json.dumps(data)
+                # Procura por indicadores de anúncios ativos
+                if '"ad_archive_id"' in str_data or '"page_name"' in str_data:
+                    anuncios_encontrados += str_data.count('"ad_archive_id"')
+                    # Extrai nomes de páginas
+                    page_names = re.findall(r'"page_name":"([^"]+)"', str_data)
+                    paginas_encontradas.update(page_names[:3])
+            except:
+                continue
+
+        # Também verifica sinais na página HTML pura
+        if not anuncios_encontrados:
+            # Sinais alternativos de anúncios ativos
+            if "Nenhum anúncio" in html or "No ads" in html or "0 results" in html.lower():
+                resultado["disponivel"] = True
+                resultado["roda_anuncios"] = False
+                resultado["observacoes"].append("Nenhum anúncio ativo encontrado na Biblioteca do Meta")
+            elif "ad_archive" in html or "sponsored" in html.lower():
+                anuncios_encontrados = 1  # Pelo menos 1 sinal encontrado
+
+        resultado["disponivel"] = True
+
+        if anuncios_encontrados > 0:
             resultado["roda_anuncios"] = True
-            resultado["total_anuncios_ativos"] = len(anuncios)
-
-            plataformas_set = set()
-            for ad in anuncios[:5]:
-                plataformas = ad.get("publisher_platforms", [])
-                plataformas_set.update(plataformas)
-                resultado["anuncios"].append({
-                    "pagina": ad.get("page_name"),
-                    "plataformas": plataformas,
-                    "inicio": ad.get("ad_delivery_start_time", ""),
-                    "texto": (ad.get("ad_creative_body") or "")[:150],
-                })
-
-            resultado["plataformas"] = list(plataformas_set)
+            resultado["total_anuncios_ativos"] = anuncios_encontrados
+            if paginas_encontradas:
+                resultado["anuncios"] = [{"pagina": p} for p in paginas_encontradas]
             resultado["observacoes"].append(
-                f"Empresa com {len(anuncios)} anúncio(s) ativo(s) — já investe em tráfego"
+                f"Empresa com anúncios ativos detectados na Biblioteca do Meta — já investe em tráfego"
             )
+            resultado["url_biblioteca"] = url
         else:
-            resultado["disponivel"] = True
             resultado["roda_anuncios"] = False
-            resultado["observacoes"].append("Nenhum anúncio ativo encontrado no Meta Ad Library")
+            resultado["observacoes"].append("Nenhum anúncio ativo detectado — verificar manualmente se necessário")
+            resultado["url_biblioteca"] = url
 
     except Exception as e:
-        resultado["motivo"] = f"Erro na consulta: {str(e)}"
+        resultado["motivo"] = f"Erro no scraping: {str(e)}"
+        resultado["observacoes"].append("Não foi possível verificar anúncios automaticamente")
 
     return resultado
 
 
 # =============================================================
-# YOUTUBE
+# YOUTUBE — busca pelo canal informado pelo lead
 # =============================================================
 
-def coletar_youtube(nome_empresa, cidade=""):
+def coletar_youtube(nome_empresa, cidade="", canal_informado=""):
+    """
+    Busca canal do YouTube.
+    Prioriza o canal informado pelo lead.
+    Se não informado, retorna não disponível (evita dados incorretos).
+    """
     resultado = {
         "disponivel": False,
         "nome_canal": None,
@@ -433,41 +447,50 @@ def coletar_youtube(nome_empresa, cidade=""):
         "observacoes": []
     }
 
-    url = f"https://www.google.com/search?q={requests.utils.quote(nome_empresa + ' ' + cidade + ' canal youtube')}"
-    resp = safe_get(url)
-    if not resp:
-        resultado["motivo"] = "Não foi possível buscar canal"
+    if not canal_informado:
+        resultado["motivo"] = "Canal não informado pelo lead"
+        resultado["observacoes"].append("Lead não informou canal do YouTube")
         return resultado
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    youtube_url = None
+    canal = normalizar_arroba(canal_informado)
 
-    for a in soup.find_all("a", href=True):
-        match = re.search(r'(https?://(?:www\.)?youtube\.com/(?:@|channel/|c/)[^&\s"]+)', a["href"])
-        if match:
-            youtube_url = match.group(1)
+    # Tenta diferentes formatos de URL do YouTube
+    tentativas = [
+        f"https://www.youtube.com/@{canal}",
+        f"https://www.youtube.com/c/{canal}",
+        f"https://www.youtube.com/user/{canal}",
+    ]
+
+    for url_tentativa in tentativas:
+        resp = safe_get(url_tentativa)
+        if resp and resp.status_code == 200:
+            resultado["url_canal"] = url_tentativa
+            resultado["disponivel"] = True
+            html = resp.text
+
+            title_match = re.search(r'"channelMetadataRenderer":\{"title":"([^"]+)"', html)
+            if title_match:
+                resultado["nome_canal"] = title_match.group(1)
+
+            subs_match = re.search(
+                r'"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"', html
+            )
+            if subs_match:
+                resultado["inscricoes"] = subs_match.group(1)
+
+            videos_match = re.search(r'"videoCountText":\{"runs":\[\{"text":"([^"]+)"', html)
+            if videos_match:
+                resultado["total_videos"] = videos_match.group(1)
+
+            if resultado["nome_canal"]:
+                resultado["observacoes"].append(f"Canal encontrado: {resultado['nome_canal']}")
+            else:
+                resultado["observacoes"].append("Canal acessado — verificar nome manualmente")
             break
 
-    if not youtube_url:
-        resultado["motivo"] = "Canal não encontrado"
-        resultado["observacoes"].append("Sem canal no YouTube identificado — oportunidade")
-        return resultado
-
-    resultado["url_canal"] = youtube_url
-    resultado["disponivel"] = True
-
-    resp_canal = safe_get(youtube_url)
-    if resp_canal:
-        html = resp_canal.text
-        title_match = re.search(r'"channelMetadataRenderer":\{"title":"([^"]+)"', html)
-        if title_match:
-            resultado["nome_canal"] = title_match.group(1)
-        subs_match = re.search(r'"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"', html)
-        if subs_match:
-            resultado["inscricoes"] = subs_match.group(1)
-        videos_match = re.search(r'"videoCountText":\{"runs":\[\{"text":"([^"]+)"', html)
-        if videos_match:
-            resultado["total_videos"] = videos_match.group(1)
+    if not resultado["disponivel"]:
+        resultado["motivo"] = f"Canal '{canal_informado}' não encontrado"
+        resultado["observacoes"].append(f"Verificar manualmente: youtube.com/@{canal}")
 
     return resultado
 
@@ -594,7 +617,7 @@ def coletar_site(url_site):
 # =============================================================
 
 def coletar_dados_completos(empresa, instagram, cidade, nicho, nome_gmn="",
-                             site="", tiktok_username="", trafego_pago=""):
+                             site="", tiktok_username="", trafego_pago="", youtube_canal=""):
     print(f"\n🔍 Coletando dados para: {empresa}")
     print("=" * 50)
 
@@ -616,7 +639,7 @@ def coletar_dados_completos(empresa, instagram, cidade, nicho, nome_gmn="",
     dados["site"] = coletar_site(site) if site else {"disponivel": False, "motivo": "Lead não possui site"}
 
     print("▶️  YouTube...")
-    dados["youtube"] = coletar_youtube(empresa, cidade)
+    dados["youtube"] = coletar_youtube(empresa, cidade, canal_informado=youtube_canal)
 
     print("🎵 TikTok...")
     dados["tiktok"] = coletar_tiktok(tiktok_username) if tiktok_username else {"disponivel": False, "motivo": "Não informado"}
@@ -713,6 +736,8 @@ def formatar_para_claude(dados):
             f"Inscritos: {yt.get('inscricoes') or 'não disponível'}",
             f"Total de vídeos: {yt.get('total_videos') or 'não disponível'}",
         ]
+        if yt.get("observacoes"):
+            linhas.append("Análise: " + " | ".join(yt["observacoes"]))
     else:
         linhas.append(f"Status: Não encontrado — {yt.get('motivo', '')}")
         if yt.get("observacoes"):
@@ -754,13 +779,19 @@ def formatar_para_claude(dados):
     linhas.append("--- META AD LIBRARY ---")
     if meta.get("disponivel"):
         if meta.get("roda_anuncios"):
-            linhas.append(f"Anúncios ativos: {meta.get('total_anuncios_ativos')}")
-            linhas.append(f"Plataformas: {', '.join(meta.get('plataformas', []))}")
-            for ad in meta.get("anuncios", [])[:3]:
-                if ad.get("texto"):
-                    linhas.append(f"Criativo: {ad['texto'][:100]}...")
+            linhas.append(f"Anúncios ativos detectados: Sim")
+            if meta.get("total_anuncios_ativos"):
+                linhas.append(f"Quantidade estimada: {meta.get('total_anuncios_ativos')}")
+            if meta.get("anuncios"):
+                paginas = [a.get("pagina") for a in meta["anuncios"] if a.get("pagina")]
+                if paginas:
+                    linhas.append(f"Páginas anunciantes: {', '.join(paginas)}")
+            if meta.get("url_biblioteca"):
+                linhas.append(f"Verificar: {meta.get('url_biblioteca')}")
         else:
-            linhas.append("Sem anúncios ativos encontrados no Meta")
+            linhas.append("Anúncios ativos: Não detectados")
+            if meta.get("url_biblioteca"):
+                linhas.append(f"Verificar manualmente: {meta.get('url_biblioteca')}")
         if meta.get("observacoes"):
             linhas.append("Análise: " + " | ".join(meta["observacoes"]))
     else:
@@ -779,7 +810,7 @@ app = Flask(__name__)
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "servico": "UC Diagnóstico v2"})
+    return jsonify({"status": "ok", "servico": "UC Diagnóstico v3"})
 
 
 @app.route("/coletar", methods=["POST"])
@@ -801,6 +832,7 @@ def api_coletar():
         site=body.get("site", ""),
         tiktok_username=body.get("tiktok", ""),
         trafego_pago=body.get("trafego_pago", ""),
+        youtube_canal=body.get("youtube_canal", ""),
     )
 
     return jsonify({
@@ -815,7 +847,7 @@ def api_coletar():
 # =============================================================
 
 def rodar_local():
-    parser = argparse.ArgumentParser(description="UC Diagnóstico v2")
+    parser = argparse.ArgumentParser(description="UC Diagnóstico v3")
     parser.add_argument("--empresa", required=True)
     parser.add_argument("--instagram", default="")
     parser.add_argument("--cidade", default="Porto Velho")
@@ -824,6 +856,7 @@ def rodar_local():
     parser.add_argument("--site", default="")
     parser.add_argument("--tiktok", default="")
     parser.add_argument("--trafego", default="")
+    parser.add_argument("--youtube", default="", help="Nome ou @ do canal do YouTube")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -836,6 +869,7 @@ def rodar_local():
         site=args.site,
         tiktok_username=args.tiktok,
         trafego_pago=args.trafego,
+        youtube_canal=args.youtube,
     )
 
     print("\n" + formatar_para_claude(dados))
@@ -856,6 +890,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         rodar_local()
     else:
-        print("🚀 Subindo API UC Diagnóstico v2...")
+        print("🚀 Subindo API UC Diagnóstico v3...")
         port = int(os.environ.get("PORT", 8080))
         app.run(host="0.0.0.0", port=port)
