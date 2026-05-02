@@ -560,51 +560,107 @@ def coletar_site(url_site):
     if not url_site.startswith("http"):
         url_site = "https://" + url_site
 
+    # Detecta plataformas conhecidas por usar carregamento dinâmico (JS)
+    PLATAFORMAS_DINAMICAS = [
+        "wix.com", "wixsite.com", "squarespace.com", "webflow.io",
+        "webflow.com", "framer.com", "framer.site", "godaddy.com",
+    ]
+
     resultado = {
         "disponivel": False,
         "url": url_site,
         "tem_ssl": url_site.startswith("https"),
-        "tem_whatsapp": False,
-        "tem_formulario": False,
-        "tem_pixel_meta": False,
-        "tem_google_analytics": False,
+        "tem_whatsapp": None,  # None = inconclusivo
+        "tem_formulario": None,
+        "tem_pixel_meta": None,
+        "tem_google_analytics": None,
+        "site_dinamico": False,
         "titulo": None,
         "observacoes": []
     }
 
     try:
         resp = requests.get(url_site, headers=HEADERS, timeout=15, allow_redirects=True)
+
         if resp.status_code == 200:
             resultado["disponivel"] = True
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
+            url_final = resp.url  # URL após redirecionamentos
 
             if soup.title:
                 resultado["titulo"] = soup.title.string
 
-            resultado["tem_whatsapp"] = bool(
-                re.search(r'wa\.me|whatsapp\.com|api\.whatsapp', html, re.IGNORECASE)
-            )
-            resultado["tem_formulario"] = bool(soup.find("form"))
-            resultado["tem_pixel_meta"] = bool(
-                re.search(r'fbq\(|facebook\.net/en_US/fbevents|connect\.facebook\.net', html)
-            )
-            resultado["tem_google_analytics"] = bool(
-                re.search(r'google-analytics\.com|ga\.js|analytics\.js|gtag', html)
-            )
+            # Detecta se é site dinâmico (Wix, Squarespace, etc.)
+            eh_dinamico = any(p in url_final for p in PLATAFORMAS_DINAMICAS)
+            # Também detecta pelo HTML
+            if not eh_dinamico:
+                eh_dinamico = bool(
+                    re.search(r'wix-code|wixStores|X-Wix-|squarespace|webflow|framer', html, re.IGNORECASE)
+                )
+            resultado["site_dinamico"] = eh_dinamico
 
-            if not resultado["tem_ssl"]:
-                resultado["observacoes"].append("Sem SSL — prejudica SEO e confiança")
-            if not resultado["tem_whatsapp"]:
-                resultado["observacoes"].append("Sem botão WhatsApp — perda de conversão")
-            if not resultado["tem_pixel_meta"]:
-                resultado["observacoes"].append("Sem Pixel Meta — impossível fazer remarketing")
-            if not resultado["tem_google_analytics"]:
-                resultado["observacoes"].append("Sem Google Analytics — sem dados de tráfego")
-            if not resultado["observacoes"]:
-                resultado["observacoes"].append("Boa estrutura básica de conversão")
+            if eh_dinamico:
+                # Site dinâmico: scraping parcial — só o que está no HTML inicial
+                resultado["observacoes"].append(
+                    "Site usa carregamento dinâmico (Wix/Squarespace/Webflow) — análise parcial via HTML estático"
+                )
+                # Ainda tenta detectar o que for possível no HTML inicial
+                tem_wpp_estatico = bool(
+                    re.search(r'wa\.me|whatsapp\.com|api\.whatsapp', html, re.IGNORECASE)
+                )
+                resultado["tem_whatsapp"] = tem_wpp_estatico if tem_wpp_estatico else None
+                resultado["tem_pixel_meta"] = bool(
+                    re.search(r'fbq\(|facebook\.net/en_US/fbevents|connect\.facebook\.net', html)
+                )
+                resultado["tem_google_analytics"] = bool(
+                    re.search(r'google-analytics\.com|ga\.js|analytics\.js|gtag', html)
+                )
+
+                if not resultado["tem_ssl"]:
+                    resultado["observacoes"].append("Sem SSL — prejudica SEO e confiança")
+                if not resultado["tem_whatsapp"]:
+                    resultado["observacoes"].append(
+                        "Botão WhatsApp: não detectado no HTML estático — verificar manualmente no site"
+                    )
+                if not resultado["tem_pixel_meta"]:
+                    resultado["observacoes"].append("Pixel Meta: não detectado — verificar manualmente")
+                if not resultado["tem_google_analytics"]:
+                    resultado["observacoes"].append("Google Analytics: não detectado — verificar manualmente")
+
+            else:
+                # Site estático: análise completa
+                resultado["tem_whatsapp"] = bool(
+                    re.search(r'wa\.me|whatsapp\.com|api\.whatsapp', html, re.IGNORECASE)
+                )
+                resultado["tem_formulario"] = bool(soup.find("form"))
+                resultado["tem_pixel_meta"] = bool(
+                    re.search(r'fbq\(|facebook\.net/en_US/fbevents|connect\.facebook\.net', html)
+                )
+                resultado["tem_google_analytics"] = bool(
+                    re.search(r'google-analytics\.com|ga\.js|analytics\.js|gtag', html)
+                )
+
+                if not resultado["tem_ssl"]:
+                    resultado["observacoes"].append("Sem SSL — prejudica SEO e confiança")
+                if not resultado["tem_whatsapp"]:
+                    resultado["observacoes"].append("Sem botão WhatsApp — perda de conversão")
+                if not resultado["tem_pixel_meta"]:
+                    resultado["observacoes"].append("Sem Pixel Meta — impossível fazer remarketing")
+                if not resultado["tem_google_analytics"]:
+                    resultado["observacoes"].append("Sem Google Analytics — sem dados de tráfego")
+                if not resultado["observacoes"]:
+                    resultado["observacoes"].append("Boa estrutura básica de conversão")
+
+        elif resp.status_code == 403:
+            resultado["disponivel"] = True
+            resultado["site_dinamico"] = True
+            resultado["observacoes"].append(
+                "Site bloqueou acesso automático (proteção anti-bot) — verificar manualmente"
+            )
         else:
             resultado["motivo"] = f"Site retornou erro {resp.status_code}"
+
     except Exception as e:
         resultado["motivo"] = f"Site inacessível: {str(e)}"
         resultado["observacoes"].append("Site offline ou com erro — problema crítico")
